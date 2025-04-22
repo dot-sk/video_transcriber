@@ -370,7 +370,7 @@ def extract_master_playlist_url(page_url: str, session: Optional[requests.Sessio
         raise ValueError(f"Extraction failed: {e}") from e
 
 
-def download_with_ytdlp(url: str, filename: str, session: Optional[requests.Session] = None) -> None:
+def download_with_ytdlp(url: str, filename: str, session: Optional[requests.Session] = None, format: str = "ba/b[height<=360]") -> None:
     """
     Downloads video from a URL (likely m3u8 playlist) using yt-dlp.
 
@@ -378,11 +378,13 @@ def download_with_ytdlp(url: str, filename: str, session: Optional[requests.Sess
         url: The URL to download from.
         filename: The output filename (path).
         session: Optional authenticated session for sites requiring login.
+        format: Format selection string for yt-dlp (default: audio-only or low-res video).
 
     Raises:
         yt_dlp.utils.DownloadError: If download fails.
     """
     logging.info(f"Starting download from {url} to {filename}")
+    logging.info(f"Using format selection: {format}")
 
     # Extract cookies from session if available
     cookies = None
@@ -392,7 +394,7 @@ def download_with_ytdlp(url: str, filename: str, session: Optional[requests.Sess
 
     ydl_opts = {
         'outtmpl': filename,
-        'format': 'best', # Or choose a specific format if needed
+        'format': format, # Use provided format selection
         'quiet': False,
         'progress': True,
         'noplaylist': True, # Ensure only single video is downloaded if URL points to one
@@ -560,6 +562,12 @@ def main():
         required=True,
         help="Password for site authentication.",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        default="ba/b[height<=480]",
+        help="Format selection for yt-dlp (default: ba/b[height<=480] - audio-only or low-res video).",
+    )
 
     args = parser.parse_args()
 
@@ -604,7 +612,7 @@ def main():
         output_transcript.parent.mkdir(parents=True, exist_ok=True)
 
         # 2. Download the video using yt-dlp with the authenticated session
-        download_with_ytdlp(master_playlist_url, str(output_video), session)
+        download_with_ytdlp(master_playlist_url, str(output_video), session, args.format)
 
         # 3. Transcribe the video using mlx-whisper
         transcribe_whisper(str(output_video), args.model, str(output_transcript))
