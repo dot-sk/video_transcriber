@@ -5,7 +5,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 from urllib.parse import urljoin
 
 import requests
@@ -292,19 +292,19 @@ def check_auth_success(response: requests.Response, session: requests.Session) -
     return True
 
 
-def extract_master_playlist_url(page_url: str, session: Optional[requests.Session] = None) -> Tuple[str, str]:
+def extract_master_playlist_urls(page_url: str, session: Optional[requests.Session] = None) -> List[Tuple[str, str]]:
     """
-    Extracts the master playlist URL (m3u8) from an iframe embedded in a page.
+    Extracts all master playlist URLs (m3u8) from iframes embedded in a page.
 
     Args:
-        page_url: The URL of the page containing the video player iframe.
+        page_url: The URL of the page containing the video player iframes.
         session: Optional authenticated session for sites requiring login.
 
     Returns:
-        Tuple containing (master_playlist_url, video_title).
+        List of tuples containing (master_playlist_url, video_title) for each video found.
 
     Raises:
-        ValueError: If the playlist URL cannot be found.
+        ValueError: If no playlist URLs can be found.
         requests.RequestException: If network requests fail.
     """
     try:
@@ -323,51 +323,99 @@ def extract_master_playlist_url(page_url: str, session: Optional[requests.Sessio
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Extract video title
-        video_title = extract_video_title(soup)
+        # Find all elements with data-iframe-src attribute using CSS selector
+        video_divs = soup.select('[data-iframe-src]')
 
-        # Find any element with data-iframe-src attribute using CSS selector
-        video_div = soup.select_one('[data-iframe-src]')
+        if not video_divs:
+            raise ValueError(f"Could not find any elements with 'data-iframe-src' attribute on page {page_url}")
 
-        if not video_div:
-            raise ValueError(f"Could not find any element with 'data-iframe-src' attribute on page {page_url}")
+        logging.info(f"Found {len(video_divs)} video(s) on the page")
 
-        iframe_src_rel = video_div.get("data-iframe-src")
-        logging.info(f"Found iframe source: {iframe_src_rel}")
+        results = []
 
-        iframe_src = urljoin(page_url, iframe_src_rel)
-        logging.info(f"Complete iframe URL: {iframe_src}")
+        for i, video_div in enumerate(video_divs, 1):
+            try:
+                # Extract video title for each video (try to find specific title or use generic one)
+                video_title = extract_video_title_for_element(soup, i)
 
-        # Fetch iframe content using the same session to maintain cookies
-        logging.info("Fetching iframe content...")
-        iframe_response = session.get(iframe_src, headers={"Referer": page_url, **headers}, timeout=30)
-        iframe_response.raise_for_status()
-        iframe_content = iframe_response.text
-        logging.info("Iframe content fetched successfully.")
+                iframe_src_rel = video_div.get("data-iframe-src")
+                logging.info(f"Video {i}: Found iframe source: {iframe_src_rel}")
 
-        # Простой поиск masterPlaylistUrl с помощью регулярного выражения
-        url_match = re.search(r'"masterPlaylistUrl"\s*:\s*"([^"]+)"', iframe_content)
-        if not url_match:
-            # Альтернативный поиск с другим возможным форматом
-            url_match = re.search(r'masterPlaylistUrl\s*=\s*[\'"]([^\'"]+)[\'"]', iframe_content)
+                iframe_src = urljoin(page_url, iframe_src_rel)
+                logging.info(f"Video {i}: Complete iframe URL: {iframe_src}")
 
-        if not url_match:
-            raise ValueError("Could not find masterPlaylistUrl in iframe content")
+                # Fetch iframe content using the same session to maintain cookies
+                logging.info(f"Video {i}: Fetching iframe content...")
+                iframe_response = session.get(iframe_src, headers={"Referer": page_url, **headers}, timeout=30)
+                iframe_response.raise_for_status()
+                iframe_content = iframe_response.text
+                logging.info(f"Video {i}: Iframe content fetched successfully.")
 
-        master_playlist_url = url_match.group(1)
+                # Простой поиск masterPlaylistUrl с помощью регулярного выражения
+                url_match = re.search(r'"masterPlaylistUrl"\s*:\s*"([^"]+)"', iframe_content)
+                if not url_match:
+                    # Альтернативный поиск с другим возможным форматом
+                    url_match = re.search(r'masterPlaylistUrl\s*=\s*[\'"]([^\'"]+)[\'"]', iframe_content)
 
-        # Unescape URL если в ней есть экранированные символы
-        master_playlist_url = master_playlist_url.replace('\\/', '/')
+                if not url_match:
+                    logging.warning(f"Video {i}: Could not find masterPlaylistUrl in iframe content, skipping")
+                    continue
 
-        logging.info(f"Successfully extracted master playlist URL: {master_playlist_url}")
-        return master_playlist_url, video_title
+                master_playlist_url = url_match.group(1)
+
+                # Unescape URL если в ней есть экранированные символы
+                master_playlist_url = master_playlist_url.replace('\\/', '/')
+
+                logging.info(f"Video {i}: Successfully extracted master playlist URL: {master_playlist_url}")
+                results.append((master_playlist_url, video_title))
+
+            except Exception as e:
+                logging.error(f"Video {i}: Error processing video: {e}")
+                continue
+
+        if not results:
+            raise ValueError("Could not extract any valid playlist URLs from the page")
+
+        logging.info(f"Successfully extracted {len(results)} video(s)")
+        return results
 
     except requests.RequestException as e:
         logging.error(f"Network error during extraction: {e}")
         raise
     except Exception as e:
-        logging.error(f"Error extracting playlist URL: {e}")
+        logging.error(f"Error extracting playlist URLs: {e}")
         raise ValueError(f"Extraction failed: {e}") from e
+
+
+def extract_video_title_for_element(soup: BeautifulSoup, video_index: int) -> str:
+    """
+    Извлекает название видео для конкретного элемента видео по индексу.
+
+    Args:
+        soup: Объект BeautifulSoup с HTML содержимым страницы.
+        video_div: Элемент video div.
+        video_index: Индекс видео на странице (начиная с 1).
+
+    Returns:
+        Название видео или "video_{index}" если заголовок не найден.
+    """
+    title = None
+
+    title_element = soup.select_one('h2.lesson-title-value')
+    if title_element and title_element.text.strip():
+        # Если на странице несколько видео, добавляем индекс
+        title = title_element.text.strip()
+        if video_index > 1:
+            title = f"{title}_часть_{video_index}"
+
+    # Если не нашли, используем значение по умолчанию
+    if not title:
+        title = f"video_part_{video_index}"
+
+    # Очищаем название от недопустимых символов в имени файла
+    title = re.sub(r'[\\/*?:"<>|]', "_", title)
+    logging.info(f"Video {video_index}: Extracted title: {title}")
+    return title
 
 
 def download_with_ytdlp(url: str, filename: str, session: Optional[requests.Session] = None, format: str = "ba/b[height<=360]") -> None:
@@ -579,47 +627,38 @@ def main():
         # Authenticate with provided credentials
         session = authenticate(args.login_url, (args.email, args.password))
 
-        # 1. Extract the master playlist URL and video title using the authenticated session
-        master_playlist_url, video_title = extract_master_playlist_url(args.page_url, session)
+        # 1. Extract the master playlist URLs and video titles using the authenticated session
+        master_playlist_urls = extract_master_playlist_urls(args.page_url, session)
 
         # Определяем имена файлов на основе заголовка видео
-        output_video = args.output
-        if not output_video:
-            output_video = downloads_dir / f"{video_title}.mp4"
-        else:
-            # Если пользователь указал имя файла явно, но не указал путь, добавляем downloads_dir
-            output_path = Path(output_video)
-            if not output_path.is_absolute() and str(output_path.parent) == '.':
-                output_video = downloads_dir / output_path
-            else:
-                output_video = output_path # Используем путь как есть
-
-        output_transcript = args.transcript
-        if not output_transcript:
-            # Используем то же имя, что и для видео, но с расширением .txt
-            transcript_path = output_video.with_suffix(".txt")
-            output_transcript = transcript_path
-        else:
-            # Если пользователь указал имя файла явно, но не указал путь, добавляем downloads_dir
-            transcript_path = Path(output_transcript)
-            if not transcript_path.is_absolute() and str(transcript_path.parent) == '.':
-                output_transcript = downloads_dir / transcript_path
-            else:
-                output_transcript = transcript_path # Используем путь как есть
+        if not master_playlist_urls:
+            raise ValueError("No valid playlist URLs found")
 
         # Убедимся, что директории для вывода существуют
-        output_video.parent.mkdir(parents=True, exist_ok=True)
-        output_transcript.parent.mkdir(parents=True, exist_ok=True)
+        for master_playlist_url, video_title in master_playlist_urls:
+            output_video = downloads_dir / f"{video_title}.mp4"
+            output_transcript = downloads_dir / f"{video_title}.txt"
+            output_video.parent.mkdir(parents=True, exist_ok=True)
+            output_transcript.parent.mkdir(parents=True, exist_ok=True)
 
-        # 2. Download the video using yt-dlp with the authenticated session
-        download_with_ytdlp(master_playlist_url, str(output_video), session, args.format)
+        # 2. Download the videos using yt-dlp with the authenticated session
+        for master_playlist_url, video_title in master_playlist_urls:
+            output_video = downloads_dir / f"{video_title}.mp4"
+            download_with_ytdlp(master_playlist_url, str(output_video), session, args.format)
 
-        # 3. Transcribe the video using mlx-whisper
-        transcribe_whisper(str(output_video), args.model, str(output_transcript))
+        # 3. Transcribe the videos using mlx-whisper
+        for master_playlist_url, video_title in master_playlist_urls:
+            output_video = downloads_dir / f"{video_title}.mp4"
+            output_transcript = downloads_dir / f"{video_title}.txt"
+            transcribe_whisper(str(output_video), args.model, str(output_transcript))
 
         logging.info("Process completed successfully!")
-        logging.info(f"Video saved to: {output_video}")
-        logging.info(f"Transcript saved to: {output_transcript}")
+        logging.info(f"Processed {len(master_playlist_urls)} video(s):")
+        for master_playlist_url, video_title in master_playlist_urls:
+            output_video = downloads_dir / f"{video_title}.mp4"
+            output_transcript = downloads_dir / f"{video_title}.txt"
+            logging.info(f"  Video: {output_video}")
+            logging.info(f"  Transcript: {output_transcript}")
 
     except (ValueError, requests.RequestException, yt_dlp.utils.DownloadError, FileNotFoundError) as e:
         logging.error(f"Process failed: {e}")
